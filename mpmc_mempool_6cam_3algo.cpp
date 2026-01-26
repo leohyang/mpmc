@@ -105,15 +105,15 @@ template <size_t N>
 struct CameraPipeline {
     static_assert((N & (N - 1)) == 0, "N must be power of 2");
     
-    VyukovMPMC<FrameSlot*, N> free_pool_q; // free pool: 管理 slot 的可复用集合（类似 reserve/free）
-    VyukovMPMC<FrameSlot*, N> qA, qB, qC; // 三个 group 的工作队列：fan-out, instantiated Vyukov 3 rings
+    VyukovMPMC<FrameSlot*, N> free_pool_q; // common free pool, descriptor only
+    VyukovMPMC<FrameSlot*, N> qA, qB, qC; //  all algorithms to process all frames vs. each algo does its own
 
-    std::array<FrameSlot, N> slots;  // 实际 slot 存储（固定 N 个）  ||||||...|||
+    std::array<FrameSlot, N> slots;  // camera buffers shall be DMAable, and GPU  ||||||...|||
 
     explicit CameraPipeline(size_t bytes) {
         for (size_t i = 0; i < N; ++i) {
             size_t sz = ((bytes + 4095) / 4096) * 4096;  // 2MB = 1024*1024*2 = 4096 x 512pages
-            slots[i].buf = std::aligned_alloc(4096, sz);
+            slots[i].buf = std::aligned_alloc(4096, sz);	// TBD: replace with DMA engine api 
             slots[i].bytes = static_cast<uint32_t>(bytes);
             slots[i].ref_count.store(0, std::memory_order_relaxed);
 
@@ -126,7 +126,7 @@ struct CameraPipeline {
     }
 };
 
-/* =========  main: 6 cameras + A/B/C groups =============== */
+/* =========  main: similate 6 cameras + A/B/C consumers =============== */
 int main() {
     constexpr int NumCams_6 = 6, NumGrps_3 = 3, FramesPerCam = 30;
     constexpr int TOTAL_FRAMES = NumCams_6 * FramesPerCam;
