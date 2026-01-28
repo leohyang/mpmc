@@ -1,9 +1,20 @@
 
-/*   Example of 6-Camera DMA Pool with MPMC lock-free support 
+/*   Model: 6-Cameras use a big DMA Pool, using MPMC lock-free
  *   Date :  2026.01.26 v0.1  leohyang@gmail.com
- *   Build:   g++ -o ~/.bin/mpmc_campool mpmc_shm_dmapool_6cam3algo.cpp -std=c++17 -lpthread
- *            ~/.bin/mpmc_campool
- * 
+ *   Build:   
+        g++ -o ~/.bin/mpmc_campool mpmc_shm_dmapool_6cam3algo.cpp -std=c++17 -lpthread
+        sudo chown root:leoh  ~/.bin/mpmc_campool
+        sudo chmod 4775 ~/.bin/mpmc_campool   
+
+        sudo bash -c '
+            rm -f /dev/shm/ipc_ctrl_dmabuf
+            for i in 0 1 2 3 4 5; do
+            rm -f /dev/shm/ipc_cam_payload_$i
+            done
+        '          
+        ~/.bin/mpmc_campool
+
+ *   Design Notes:    
     - control-plane: shared memory Vyukov rings
     - data-plane: DMA-BUF alloc from dma-heap via ioctl by child producer proc
     - each DMA buffer has its own fd, classic socket fd tx to consumer A/B/C procs
@@ -31,52 +42,26 @@
 #include <sys/un.h>
 #include <errno.h>
 
-using std::cout;
-using std::cerr;
+using namespace std;
 
-static constexpr int    NumCams_6    = 6;
-static constexpr int    NumGrps_3    = 3;
-static constexpr int    FramesPerCam_30 = 30;
-static constexpr int    TOTAL_FRM_180 = NumCams_6 * FramesPerCam_30;
+/* some real situation numbers to model and validate   */
+        static constexpr int    NumCams_6    = 6;   // 6 cameras = 6 pipelines
+        static constexpr int    NumGrps_3    = 3;   // each pipeline has 3 consumers
+        static constexpr int    FramesPerCam_30 = 30;
+        static constexpr int    TOTAL_FRM_180 = NumCams_6 * FramesPerCam_30;
 
-static constexpr int A_workers = 6;
-static constexpr int B_workers = 3;
-static constexpr int C_workers = 2;
+        static constexpr int    A_workers = 6;    // consumer A, heaviest computing, most worker threads
+        static constexpr int    B_workers = 3;    // consumer B, avg computing load, 
+        static constexpr int    C_workers = 2;    // consumer C, simplest computing, least workers
 
-static constexpr size_t NslotsPow2 = 64;
-static constexpr size_t BUF_BYTES_2MB  = 2 * 1024 * 1024;
+        static constexpr size_t NslotsPow2 = 32;    // 64 tested good, per fps and worst latency
+        static constexpr size_t BUF_BYTES_2MB  = 2 * 1024 * 1024;
 
-static constexpr int TOTAL_SLOTS_64x6 = NumCams_6 * (int)NslotsPow2;
+        static constexpr int    TOTAL_SLOTS_64x6 = NumCams_6 * (int)NslotsPow2;
 
-static_assert(std::atomic<size_t>::is_always_lock_free,
-              "atomic<size_t> must be lock-free for this demo (Vyukov MPMC requirement)");
-
-static inline uint32_t make_slot_id(uint32_t cam_id, uint32_t slot_id) {
-    return cam_id * (uint32_t)NslotsPow2 + slot_id;
-}
-static inline uint32_t slot_cam(uint32_t slot_id) { return slot_id / (uint32_t)NslotsPow2; }
-static inline uint32_t slot_idx(uint32_t slot_id) { return slot_id % (uint32_t)NslotsPow2; }
-
-// ---------- dma-heap ioctl fallback ----------
-#ifndef DMA_HEAP_IOC_MAGIC
-    #define DMA_HEAP_IOC_MAGIC 'H'
-#endif
-
-struct dma_heap_allocation_data {  // fixed/predefined per include/uapi/linux/dma-heap.h
-    uint64_t len;
-    uint32_t fd;                // explicitly manually define the identical struct for ioctl at user space
-    uint32_t fd_flags;
-    uint64_t heap_flags;
-};
-
-#ifndef DMA_HEAP_IOCTL_ALLOC
-    #include <linux/ioctl.h>
-    #define DMA_HEAP_IOCTL_ALLOC _IOWR(DMA_HEAP_IOC_MAGIC, 0x0, struct dma_heap_allocation_data)
-#endif
-
-/* ================= Vyukov style bounded MPMC (shared memory) ================= */
-template <typename T, size_t Pow2N>
-struct MPMCQueue {
+/*  Vyukov style bounded MPMC */
+template <typename T, size_t Pow2N>     // T = "uint32_t", 1 pipeline need 4 such queues
+struct MPMCQueue {                      // each pipeline has 1x Producers + 3x Consumers
     static_assert((Pow2N & (Pow2N - 1)) == 0, "Capacity must be power of 2");
     static constexpr size_t mask_ = Pow2N - 1;
 
@@ -87,7 +72,8 @@ struct MPMCQueue {
     Cell cells[Pow2N];
 
     void init() {
-        for (size_t i = 0; i < Pow2N; ++i) cells[i].seq.store(i, std::memory_order_relaxed);
+        for (size_t i = 0; i < Pow2N; ++i) 
+            cells[i].seq.store(i, std::memory_order_relaxed);
         head.store(0, std::memory_order_relaxed);
         tail.store(0, std::memory_order_relaxed);
     }
@@ -98,7 +84,7 @@ struct MPMCQueue {
         for (;;) {
             cell = &cells[hpos & mask_];
             size_t seq = cell->seq.load(std::memory_order_acquire);
-            intptr_t diff = (intptr_t)seq - (intptr_t)hpos;
+            long int diff = (long int)seq - (long int)hpos;
             if (diff == 0) {
                 if (head.compare_exchange_weak(hpos, hpos + 1,
                                               std::memory_order_relaxed, std::memory_order_relaxed))
@@ -120,7 +106,7 @@ struct MPMCQueue {
         for (;;) {
             cell = &cells[tpos & mask_];
             size_t seq = cell->seq.load(std::memory_order_acquire);
-            intptr_t diff = (intptr_t)seq - (intptr_t)(tpos + 1);
+            long int diff = (long int)seq - (long int)(tpos + 1);
             if (diff == 0) {
                 if (tail.compare_exchange_weak(tpos, tpos + 1,
                                               std::memory_order_release, std::memory_order_relaxed))
@@ -137,6 +123,13 @@ struct MPMCQueue {
     }
 };
 
+
+static inline uint32_t make_slot_id(uint32_t cam_id, uint32_t slot_id) {
+    return cam_id * (uint32_t)NslotsPow2 + slot_id;
+}
+static inline uint32_t slot_cam(uint32_t slot_id) { return slot_id / (uint32_t)NslotsPow2; }
+static inline uint32_t slot_idx(uint32_t slot_id) { return slot_id % (uint32_t)NslotsPow2; }
+
 // ctrl shm slot meta
 struct FrameSlotMeta {
     uint32_t bytes;
@@ -150,7 +143,8 @@ struct CameraPipeline {
     FrameSlotMeta slots[N];
 
     void init(uint32_t cam_id) {
-        free_pool_q.init(); qA.init(); qB.init(); qC.init();
+        free_pool_q.init(); 
+        qA.init(); qB.init(); qC.init();
         for (uint32_t i = 0; i < (uint32_t)N; ++i) {
             slots[i].bytes = (uint32_t)BUF_BYTES_2MB;
             slots[i].ref_count.store(0, std::memory_order_relaxed);
@@ -262,6 +256,24 @@ struct SharedPipelinesCtrl {
         return true;
     }
 
+
+// ---------- dma-heap ioctl fallback ----------
+#ifndef DMA_HEAP_IOC_MAGIC
+    #define DMA_HEAP_IOC_MAGIC 'H'
+#endif
+
+struct dma_heap_allocation_data {  // fixed/predefined per include/uapi/linux/dma-heap.h
+    uint64_t len;
+    uint32_t fd;                // explicitly manually define the identical struct for ioctl at user space
+    uint32_t fd_flags;
+    uint64_t heap_flags;
+};
+
+#ifndef DMA_HEAP_IOCTL_ALLOC
+    #include <linux/ioctl.h>
+    #define DMA_HEAP_IOCTL_ALLOC _IOWR(DMA_HEAP_IOC_MAGIC, 0x0, struct dma_heap_allocation_data)
+#endif
+
 // ===== DMA-BUF allocation (producer) 1x only by producer =====
 struct DmaBufPool {
     int heap_fd = -1;
@@ -289,7 +301,8 @@ struct DmaBufPool {
             if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &data) != 0) { perror("DMA_HEAP_IOCTL_ALLOC"); return false; }
 
             int fd = (int)data.fd;
-            void* p = mmap(nullptr, BUF_BYTES_2MB, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            void* p = mmap(nullptr, BUF_BYTES_2MB, PROT_READ | PROT_WRITE, 
+                            MAP_SHARED, fd, 0);
             if (p == MAP_FAILED) { perror("mmap dmabuf"); close(fd); return false; }
             dma_fd[sid] = fd;
             dma_mm_p[sid] = p;
@@ -420,7 +433,7 @@ static int run_consumer(SharedPipelinesCtrl* shmp, int gid, int workers, int soc
     std::vector<std::thread> threads;
     threads.reserve(workers);
 
-    for (int w = 0; w < workers; ++w) {         //  6/3/2 threads of each A/B/C algorithms
+    for (int w = 0; w < workers; ++w) {  //  6/3/2 threads of each A/B/C algorithms
         threads.emplace_back([&, w] {  // [C, gid, w, &fdt, &workerCnt]
             int next_cam = 0;
 
@@ -448,7 +461,7 @@ static int run_consumer(SharedPipelinesCtrl* shmp, int gid, int workers, int soc
                 // wait for data-plane fd arrival
                 int fd = fdt->take_blocking(sid);
 
-                // mmap and touch payload
+                // mmap and touch payload, zero-copy, process frame data
                 void* p = mmap(nullptr, BUF_BYTES_2MB, PROT_READ, MAP_SHARED, fd, 0);
                 if (p == MAP_FAILED) { perror("consumer mmap dmabuf"); close(fd); continue; }
                 volatile uint8_t v = ((uint8_t*)p)[gid];
@@ -459,6 +472,7 @@ static int run_consumer(SharedPipelinesCtrl* shmp, int gid, int workers, int soc
                 // last consumer returns to free_pool (ref_count--)
                 if (shmp->cams[camid].slots[idx].ref_count.fetch_sub(
                                 1, std::memory_order_acq_rel) == 1) {
+                                    // 
                     while (!shmp->cams[camid].free_pool_q.enqueue(sid))
                                  std::this_thread::yield();
                 }
@@ -485,7 +499,7 @@ static void shm_unmap_destroy(void* p, size_t bytes, int fd, const std::string& 
 }
 
 int main() {
-    const std::string ctrl_name = "/ipc_ctrl_dmabuf";
+    const std::string ctrl_name = "/ipc_ctrl_dmabuf";  // "/dev/shm" + "/xxx"
     const size_t ctrl_bytes = sizeof(SharedPipelinesCtrl);
     int ctrl_fd = -1;  // Create ctrl shm in parent before fork
 
@@ -598,3 +612,40 @@ int main() {
     unlink(sockC_path.c_str());
     return 0;
 }
+
+/*
+leoh@Ubuntu24:~$ sudo chown root:root ~/.bin/mpmc_campool2
+leoh@Ubuntu24:~$ sudo chmod 4775 ~/.bin/mpmc_campool2
+leoh@Ubuntu24:~$ ~/.bin/mpmc_campool2
+shm open failed: Permission denied
+leoh@Ubuntu24:~$ 
+shm open failed: Permission denied
+^C
+leoh@Ubuntu24:~$         sudo bash -c '
+            rm -f /dev/shm/ipc_ctrl_dmabuf
+            for i in 0 1 2 3 4 5; do
+            rm -f /dev/shm/ipc_cam_payload_$i
+            done
+        '     
+leoh@Ubuntu24:~$ ~/.bin/mpmc_campool2
+[Group 1] per-worker:
+  W[0]=75
+  W[1]=57
+  W[2]=48
+[Group 2] per-worker:
+  W[0]=85
+  W[1]=95
+[Group 0] per-worker:
+  W[0]=11
+  W[1]=35
+  W[2]=30
+  W[3]=31
+  W[4]=57
+  W[5]=16
+IPC (ctrl shm + dmabuf + SCM_RIGHTS) finished.
+Group A done=180 / 180
+Group B done=180 / 180
+Group C done=180 / 180
+Producer done=1
+leoh@Ubuntu
+*/
